@@ -1,0 +1,100 @@
+#include <SoftwareSerial.h>
+
+// Pins stay exactly as they are on your PCB
+#define RE_DE 4        
+const byte rxPin = 2;  // RO
+const byte txPin = 3;  // DI
+SoftwareSerial modbus(rxPin, txPin);
+
+const byte fpgaRxPin = A5;
+const byte fpgaTxPin = A4; 
+SoftwareSerial fpgaSerial(fpgaRxPin, fpgaTxPin);
+
+// Bulk inquiry frame: Reads 7 registers starting from 0x0000
+// Most 7-in-1 sensors follow this address map.
+const byte bulk_frame[] = {0x01, 0x03, 0x00, 0x00, 0x00, 0x07, 0x04, 0x08};
+byte values[20]; 
+
+void setup() {
+  Serial.begin(9600);  
+  modbus.begin(4800);  
+  fpgaSerial.begin(9600);
+
+  pinMode(RE_DE, OUTPUT);
+  digitalWrite(RE_DE, LOW);    
+  
+  Serial.println("PCB Mode: SoftSerial + Bulk Read + Auto-Retry");
+}
+
+void loop() {
+  bool success = false;
+
+  // Attempt to read the sensor up to 3 times if it fails
+  for (int retry = 0; retry < 3; retry++) {
+    if (readBulkSensor()) {
+      success = true;
+      break; 
+    }
+    Serial.print("Retrying sensor read... Attempt ");
+    Serial.println(retry + 1);
+    delay(200); 
+  }
+
+  if (success) {
+    // Mapping bytes based on standard 7-in-1 Modbus response:
+    // values[3,4]=Moist, [5,6]=Temp, [7,8]=EC, [9,10]=pH, [11,12]=N, [13,14]=P, [15,16]=K
+    int val_Moist = (values[3] << 8) | values[4];
+    int raw_pH    = (values[9] << 8) | values[10];
+    int val_N     = (values[11] << 8) | values[12];
+    int val_P     = (values[13] << 8) | values[14];
+    int val_K     = (values[15] << 8) | values[16];
+
+    int true_Moisture = val_Moist / 10;
+
+    // Send to FPGA
+    fpgaSerial.print(val_N); fpgaSerial.print(",");
+    fpgaSerial.print(val_P); fpgaSerial.print(",");
+    fpgaSerial.print(val_K); fpgaSerial.print(",");
+    fpgaSerial.print(raw_pH); fpgaSerial.print(",");
+    fpgaSerial.println(true_Moisture);
+
+    // Print to Serial Monitor
+    Serial.print("[DATA] N:"); Serial.print(val_N);
+    Serial.print(" P:"); Serial.print(val_P);
+    Serial.print(" K:"); Serial.print(val_K);
+    Serial.print(" pH:"); Serial.print(raw_pH);
+    Serial.print(" Moist:"); Serial.println(true_Moisture);
+  } else {
+    Serial.println("[ERROR] Sensor failed to respond after 3 attempts.");
+  }
+
+  delay(2000); // Wait 2 seconds before next reading
+}
+
+bool readBulkSensor() {
+  modbus.listen(); // Force focus to Modbus pins
+  delay(50);
+  
+  while(modbus.available()) { modbus.read(); } // Clear noise
+
+  digitalWrite(RE_DE, HIGH);
+  delay(10);
+  modbus.write(bulk_frame, 8);
+  modbus.flush(); 
+  digitalWrite(RE_DE, LOW);
+
+  unsigned long startTime = millis();
+  // Expecting 19 bytes (Standard Modbus: 3 header + 14 data + 2 CRC)
+  while(modbus.available() < 19 && millis() - startTime < 1000) {
+    delay(1);
+  }
+
+  if(modbus.available() >= 19) {
+    for(byte i=0; i<19; i++) {
+      values[i] = modbus.read();
+    }
+    return true; 
+  }
+  
+  return false;
+}
