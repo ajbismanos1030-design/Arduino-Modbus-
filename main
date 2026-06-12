@@ -1,0 +1,152 @@
+#include <SoftwareSerial.h>
+
+// Pins stay exactly as they are on your PCB
+#define RE_DE 4        
+const byte rxPin = 2;  // RO
+const byte txPin = 3;  // DI
+SoftwareSerial modbus(rxPin, txPin);
+
+const byte fpgaRxPin = A5;
+const byte fpgaTxPin = A4; 
+SoftwareSerial fpgaSerial(fpgaRxPin, fpgaTxPin);
+
+// Bulk inquiry frame: Reads 7 registers starting from 0x0000
+const byte bulk_frame[] = {0x01, 0x03, 0x00, 0x00, 0x00, 0x07, 0x04, 0x08};
+byte values[20]; 
+
+// ==========================================
+// MOVING AVERAGE FILTER CONFIGURATION
+// ==========================================
+const int numReadings = 10; // Shock absorber size
+int readIndex = 0;          // Current position in the circular array
+int readingsCount = 0;      // Tracks how many readings we have so far (for the warmup fix)
+
+int readings_N[numReadings] = {0};
+int readings_P[numReadings] = {0};
+int readings_K[numReadings] = {0};
+int readings_pH[numReadings] = {0};
+int readings_Moist[numReadings] = {0};
+
+long total_N = 0, total_P = 0, total_K = 0, total_pH = 0, total_Moist = 0;
+
+void setup() {
+  Serial.begin(9600);  
+  modbus.begin(4800);  
+  fpgaSerial.begin(9600);
+
+  pinMode(RE_DE, OUTPUT);
+  digitalWrite(RE_DE, LOW);    
+  
+  Serial.println("PCB Mode: SoftSerial + Bulk Read + Auto-Retry + Moving Average Filter");
+}
+
+void loop() {
+  bool success = false;
+
+  // Attempt to read the sensor up to 3 times if it fails
+  for (int retry = 0; retry < 3; retry++) {
+    if (readBulkSensor()) {
+      success = true;
+      break; 
+    }
+    Serial.print("Retrying sensor read... Attempt ");
+    Serial.println(retry + 1);
+    delay(200); 
+  }
+
+  if (success) {
+    // 1. EXTRACT RAW DATA
+    int val_Moist = (values[3] << 8) | values[4];
+    int raw_pH    = (values[9] << 8) | values[10];
+    int val_N     = (values[11] << 8) | values[12];
+    int val_P     = (values[13] << 8) | values[14];
+    int val_K     = (values[15] << 8) | values[16];
+    int true_Moisture = val_Moist / 10;
+
+    // 2. SUBTRACT OLDEST READING FROM THE TOTAL
+    total_N -= readings_N[readIndex];
+    total_P -= readings_P[readIndex];
+    total_K -= readings_K[readIndex];
+    total_pH -= readings_pH[readIndex];
+    total_Moist -= readings_Moist[readIndex];
+
+    // 3. INSERT NEWEST READING INTO THE ARRAY
+    readings_N[readIndex] = val_N;
+    readings_P[readIndex] = val_P;
+    readings_K[readIndex] = val_K;
+    readings_pH[readIndex] = raw_pH;
+    readings_Moist[readIndex] = true_Moisture;
+
+    // 4. ADD NEWEST READING TO THE TOTAL
+    total_N += readings_N[readIndex];
+    total_P += readings_P[readIndex];
+    total_K += readings_K[readIndex];
+    total_pH += readings_pH[readIndex];
+    total_Moist += readings_Moist[readIndex];
+
+    // 5. ADVANCE INDEX
+    readIndex++;
+    if (readIndex >= numReadings) {
+      readIndex = 0;
+    }
+
+    // 6. WARM-UP FIX: Only divide by actual readings taken, up to max numReadings
+    if (readingsCount < numReadings) {
+      readingsCount++;
+    }
+
+    // 7. CALCULATE THE SMOOTHED AVERAGE
+    int smooth_N = total_N / readingsCount;
+    int smooth_P = total_P / readingsCount;
+    int smooth_K = total_K / readingsCount;
+    int smooth_pH = total_pH / readingsCount;
+    int smooth_Moist = total_Moist / readingsCount;
+
+    // 8. SEND CLEAN DATA TO FPGA
+    fpgaSerial.print(smooth_N); fpgaSerial.print(",");
+    fpgaSerial.print(smooth_P); fpgaSerial.print(",");
+    fpgaSerial.print(smooth_K); fpgaSerial.print(",");
+    fpgaSerial.print(smooth_pH); fpgaSerial.print(",");
+    fpgaSerial.println(smooth_Moist);
+
+    // Print to Serial Monitor for your debugging
+    Serial.print("[SMOOTHED] N:"); Serial.print(smooth_N);
+    Serial.print(" P:"); Serial.print(smooth_P);
+    Serial.print(" K:"); Serial.print(smooth_K);
+    Serial.print(" pH:"); Serial.print(smooth_pH);
+    Serial.print(" Moist:"); Serial.println(smooth_Moist);
+    
+  } else {
+    Serial.println("[ERROR] Sensor failed to respond after 3 attempts.");
+  }
+
+  delay(2000); // Wait 2 seconds before next reading
+}
+
+bool readBulkSensor() {
+  modbus.listen(); // Force focus to Modbus pins
+  delay(50);
+  
+  while(modbus.available()) { modbus.read(); } // Clear noise
+
+  digitalWrite(RE_DE, HIGH);
+  delay(10);
+  modbus.write(bulk_frame, 8);
+  modbus.flush(); 
+  digitalWrite(RE_DE, LOW);
+
+  unsigned long startTime = millis();
+  // Expecting 19 bytes (Standard Modbus: 3 header + 14 data + 2 CRC)
+  while(modbus.available() < 19 && millis() - startTime < 1000) {
+    delay(1);
+  }
+
+  if(modbus.available() >= 19) {
+    for(byte i=0; i<19; i++) {
+      values[i] = modbus.read();
+    }
+    return true; 
+  }
+  
+  return false;
+}
